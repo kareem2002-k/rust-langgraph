@@ -3,10 +3,18 @@ name = "rust-langgraph"
 version = "0.1.0"
 edition = "2021"
 authors = ["Rust LangGraph contributors"]
-description = "Rust LangGraph — a community graph runtime for LLM agents, inspired by LangGraph (not affiliated with LangChain). Build stateful, multi-actor workflows in Rust."
+description = """
+Stateful graph runtime for LLM workflows in Rust (community project; not affiliated with LangChain).
+Pregel-style execution: nodes, conditional edges, checkpoints, streaming. Optional adapters for
+Ollama, OpenAI, OpenRouter (OpenAI-compatible), and Anthropic; optional ReAct agent + tools.
+Crate import: rust_langgraph (underscore). Default features include in-memory checkpoints.
+Enable Cargo features explicitly for LLM modules (e.g. ollama, openai, openrouter, anthropic, prebuilt).
+See README.md on crates.io for copy-paste Cargo.toml, env vars, and common mistakes.
+"""
 license = "MIT"
 repository = "https://github.com/yourusername/rust-langgraph"
-keywords = ["rust-langgraph", "langgraph", "llm", "agent", "graph", "workflow"]
+documentation = "https://docs.rs/rust-langgraph"
+keywords = ["langgraph", "llm", "agent", "workflow", "async"]
 categories = ["asynchronous", "web-programming"]
 readme = "README.md"
 
@@ -95,4 +103,3 @@ path = "examples/08_custom_state.rs"
 name = "openrouter_chat"
 path = "examples/07_openrouter_chat.rs"
 required-features = ["openrouter"]
-

@@ -16,19 +16,45 @@
 
 ## Table of contents
 
-1. [What this crate is](#what-this-crate-is)
-2. [Who should use it](#who-should-use-it)
-3. [Installation](#installation)
-4. [Five-minute tutorial](#five-minute-tutorial)
-5. [Core concepts](#core-concepts)
-6. [Graph API reference](#graph-api-reference)
-7. [LLMs and agents](#llms-and-agents)
-8. [Feature flags](#feature-flags)
-9. [Project layout](#project-layout)
-10. [Examples](#examples)
-11. [Docs for humans vs. tooling](#documentation)
-12. [Comparison with Python LangGraph](#comparison-with-python-langgraph)
-13. [License & acknowledgments](#license)
+1. [Quick reference (implementers & AI agents)](#quick-reference-implementers--ai-agents)
+2. [What this crate is](#what-this-crate-is)
+3. [Who should use it](#who-should-use-it)
+4. [Installation](#installation)
+5. [Copy-paste `Cargo.toml` recipes](#copy-paste-cargotoml-recipes)
+6. [Environment variables](#environment-variables)
+7. [Five-minute tutorial](#five-minute-tutorial)
+8. [Core concepts](#core-concepts)
+9. [Graph API reference](#graph-api-reference)
+10. [LLMs and agents](#llms-and-agents)
+11. [Feature flags (detailed)](#feature-flags-detailed)
+12. [Prelude and conditional exports](#prelude-and-conditional-exports)
+13. [Common mistakes & compile errors](#common-mistakes--compile-errors)
+14. [Verification commands](#verification-commands)
+15. [Project layout](#project-layout)
+16. [Examples](#examples)
+17. [Documentation](#documentation)
+18. [Comparison with Python LangGraph](#comparison-with-python-langgraph)
+19. [License & acknowledgments](#license)
+
+---
+
+## Quick reference (implementers & AI agents)
+
+Use this block as a **single source of truth** before writing or generating code.
+
+| Fact | Correct value |
+|------|----------------|
+| **Cargo package name** (in `[dependencies]`) | `rust-langgraph` (hyphen) |
+| **Rust crate path** (in `use`) | `rust_langgraph` (underscore) |
+| **Wrong** | `langgraph::` — that is not this crate’s name |
+| **Async runtime** | **Tokio** required (`#[tokio::main]` or equivalent) |
+| **Edition** | Rust 2021 |
+| **Default Cargo features** | `memory-checkpoint` (enables `MemorySaver`) |
+| **LLM modules** | **Not** in the build unless you add the matching feature |
+
+**Rule:** If you `use rust_langgraph::llm::ollama::...`, your `Cargo.toml` **must** include `features = ["ollama"]` (same for `openai`, `openrouter`, `anthropic`). If you use `create_react_agent` / `Tool`, you **must** enable `prebuilt` **and** at least one LLM feature for a real model.
+
+**Human + agent doc:** [`AGENTS.md`](AGENTS.md) — patterns, signatures, and pitfalls in compact form.
 
 ---
 
@@ -49,39 +75,124 @@ Use it for multi-step LLM apps, tool-calling agents, branching pipelines, and an
 | You want… | Use… |
 |-----------|------|
 | A small graph without LLMs | `StateGraph` + custom `State` |
-| Chat + tools (ReAct-style) | `prebuilt` feature: `create_react_agent`, `Tool`, `ToolNode` |
-| Local models | `ollama` feature: `llm::ollama::OllamaAdapter` |
-| OpenAI / Anthropic APIs | `openai` / `anthropic` features under `rust_langgraph::llm` |
-| [OpenRouter](https://openrouter.ai/docs/quickstart) (many providers, one API) | `openrouter` feature: `llm::openrouter::OpenRouterAdapter` |
-| Persistence between runs | `MemorySaver` or DB backends (`sqlite` / `postgres` features) |
+| Chat + tools (ReAct-style) | `prebuilt` + an LLM feature: `create_react_agent`, `Tool`, `ToolNode` |
+| Local models | `ollama` → `llm::ollama::OllamaAdapter` |
+| OpenAI API | `openai` → `llm::openai::OpenAIAdapter` |
+| [OpenRouter](https://openrouter.ai/docs/quickstart) (many providers, one API) | `openrouter` → `llm::openrouter::OpenRouterAdapter` |
+| Anthropic API | `anthropic` → `llm::anthropic::AnthropicAdapter` |
+| Persistence between runs | `MemorySaver` (default feature) or `sqlite` / `postgres` |
 
 ---
 
 ## Installation
 
-**`Cargo.toml`:**
+**Minimal `Cargo.toml`** (graph core only — checkpoints in memory):
 
 ```toml
 [dependencies]
 rust-langgraph = "0.1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-# Optional: use with `futures::StreamExt` when consuming `CompiledGraph::stream`
-futures = "0.3"
+futures = "0.3"  # for StreamExt when using CompiledGraph::stream
 ```
 
-**Import in Rust:**
+**Import:**
 
 ```rust
 use rust_langgraph::prelude::*;
 ```
 
-Optional: enable features you need (see [Feature flags](#feature-flags)).
+Enable optional features as needed (see [Copy-paste recipes](#copy-paste-cargotoml-recipes) and [Feature flags](#feature-flags-detailed)).
 
 **Requirements:**
 
-- Rust 2021 edition
-- Async runtime: **Tokio** (the library is async-first)
+- Rust 2021
+- **Tokio** — the library is async-first
+
+---
+
+## Copy-paste `Cargo.toml` recipes
+
+Replace version pins if your workspace pins differently.
+
+### Graph + in-memory checkpoints only (default)
+
+```toml
+[dependencies]
+rust-langgraph = "0.1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+futures = "0.3"
+```
+
+### + Ollama (local HTTP API)
+
+```toml
+rust-langgraph = { version = "0.1", features = ["ollama"] }
+```
+
+### + OpenAI (`OPENAI_API_KEY` for `OpenAIAdapter::new`)
+
+```toml
+rust-langgraph = { version = "0.1", features = ["openai"] }
+```
+
+### + OpenRouter ([quickstart](https://openrouter.ai/docs/quickstart))
+
+```toml
+rust-langgraph = { version = "0.1", features = ["openrouter"] }
+```
+
+### + Anthropic (pass key via `AnthropicAdapter::with_api_key` — no standard env in adapter)
+
+```toml
+rust-langgraph = { version = "0.1", features = ["anthropic"] }
+```
+
+### ReAct agent (tools + graph) + Ollama
+
+```toml
+rust-langgraph = { version = "0.1", features = ["ollama", "prebuilt"] }
+```
+
+### ReAct + OpenRouter
+
+```toml
+rust-langgraph = { version = "0.1", features = ["openrouter", "prebuilt"] }
+```
+
+### All optional LLM adapters (for examples or experimentation)
+
+```toml
+rust-langgraph = { version = "0.1", features = [
+  "ollama", "openai", "openrouter", "anthropic", "prebuilt"
+] }
+```
+
+### SQLite checkpoints
+
+```toml
+rust-langgraph = { version = "0.1", features = ["sqlite"] }
+```
+
+### PostgreSQL checkpoints
+
+```toml
+rust-langgraph = { version = "0.1", features = ["postgres"] }
+```
+
+---
+
+## Environment variables
+
+| Variable | Used by | Notes |
+|----------|---------|--------|
+| `OPENAI_API_KEY` | `OpenAIAdapter::new(...)` | `with_api_key` bypasses env |
+| `OPENROUTER_API_KEY` | `OpenRouterAdapter::new(...)` | `with_api_key` bypasses env |
+| *(none by default)* | `AnthropicAdapter` | Use `AnthropicAdapter::with_api_key("sk-ant-...")` |
+| *(none by default)* | `OllamaAdapter` | Default base `http://localhost:11434`; override with `with_base_url` |
+
+Set secrets in the environment or inject keys explicitly in code — do not commit API keys.
 
 ---
 
@@ -195,7 +306,7 @@ while let Some(event) = stream.next().await {
 }
 ```
 
-For token-level LLM streams, call **`ChatModel::stream`** on **`OllamaAdapter`** / **`OpenAIAdapter`** / **`OpenRouterAdapter`** / **`AnthropicAdapter`**.
+For token-level LLM streams, call **`ChatModel::stream`** on **`OllamaAdapter`** / **`OpenAIAdapter`** / **`OpenRouterAdapter`** / **`AnthropicAdapter`** (with the matching feature enabled).
 
 ---
 
@@ -238,7 +349,7 @@ let model = OllamaAdapter::new("llama3.1:8b");
 let reply = model.invoke(&[Message::user("Hello")]).await?;
 ```
 
-**OpenRouter** ([quickstart](https://openrouter.ai/docs/quickstart)) — OpenAI-compatible HTTP API; set `OPENROUTER_API_KEY` and use a router model id (e.g. `openai/gpt-4o-mini`):
+**OpenRouter** — set `OPENROUTER_API_KEY` and use a router model id (e.g. `openai/gpt-4o-mini`):
 
 ```rust
 use rust_langgraph::llm::openrouter::OpenRouterAdapter;
@@ -255,8 +366,8 @@ let reply = model.invoke(&[Message::user("Hello")]).await?;
 ### ReAct agent (graph with `agent` ↔ `tools` loop)
 
 1. Define **`Tool`** instances with **`Tool::new(...).with_schema(json_schema)`**.
-2. Bind the same tools to the model: e.g. **`OllamaAdapter::new(...).with_tools(vec![t.to_tool_info(), ...])`**.
-3. Call **`create_react_agent(model, tools)`** → get a **`CompiledGraph<MessagesState>`**.
+2. Bind the same tools to the model (e.g. **`OllamaAdapter::with_tools(vec![t.to_tool_info(), ...])`** or **`OpenAIAdapter::bind_tools` / `OpenRouterAdapter::bind_tools`**).
+3. Call **`create_react_agent(model, tools)`** → get a **`CompiledGraph<MessagesState>`** (requires **`prebuilt`**).
 4. **`invoke(MessagesState { messages: vec![Message::user("...")] }, Config::default())`**.
 
 See **`examples/06_react_agent_ollama.rs`** for a full runnable flow.
@@ -267,22 +378,90 @@ See **`examples/06_react_agent_ollama.rs`** for a full runnable flow.
 
 ---
 
-## Feature flags
+## Feature flags (detailed)
 
 ```toml
 rust-langgraph = { version = "0.1", features = ["ollama", "prebuilt", "openai", "openrouter"] }
 ```
 
-| Feature | What it enables |
-|---------|------------------|
-| `memory-checkpoint` | **Default.** In-memory `MemorySaver` |
-| `sqlite` | SQLite checkpoint backend (`sqlx`) |
-| `postgres` | PostgreSQL checkpoint backend |
-| `openai` | `llm::openai::OpenAIAdapter` + `reqwest` + `async-openai` |
-| `openrouter` | `llm::openrouter::OpenRouterAdapter` (OpenAI-compatible client → `https://openrouter.ai/api/v1`) |
-| `anthropic` | `llm::anthropic::AnthropicAdapter` |
-| `ollama` | `llm::ollama::OllamaAdapter` |
-| `prebuilt` | `create_react_agent`, `Tool`, `ToolNode`, `validate_chat_history` |
+| Feature | Enables | Pulls in (transitively) |
+|---------|---------|-------------------------|
+| `memory-checkpoint` | **Default.** In-memory `MemorySaver` | (no extra crates beyond core) |
+| `sqlite` | SQLite checkpoint backend | `sqlx` + SQLite |
+| `postgres` | PostgreSQL checkpoint backend | `sqlx` + Postgres |
+| `openai` | `llm::openai::OpenAIAdapter` | `reqwest`, `async-openai` |
+| `openrouter` | `llm::openrouter::OpenRouterAdapter` | `reqwest`, `async-openai` |
+| `anthropic` | `llm::anthropic::AnthropicAdapter` | `reqwest` |
+| `ollama` | `llm::ollama::OllamaAdapter` | `reqwest` |
+| `prebuilt` | `create_react_agent`, `Tool`, `ToolNode`, `validate_chat_history` | (no extra deps) |
+
+**Import ↔ feature gate:**
+
+| You import | Required feature |
+|------------|------------------|
+| `rust_langgraph::llm::ollama::*` | `ollama` |
+| `rust_langgraph::llm::openai::*` | `openai` |
+| `rust_langgraph::llm::openrouter::*` | `openrouter` |
+| `rust_langgraph::llm::anthropic::*` | `anthropic` |
+| `rust_langgraph::prelude::ChatModel` | one of `ollama`, `openai`, `openrouter`, `anthropic` |
+| `rust_langgraph::prelude::{create_react_agent, Tool, ToolNode}` | `prebuilt` |
+| `rust_langgraph::prelude::MemorySaver` | `memory-checkpoint` (default) |
+
+---
+
+## Prelude and conditional exports
+
+```rust
+use rust_langgraph::prelude::*;
+```
+
+**Always available (with default features):** `Config`, `Error`, `Result`, `State`, `MessagesState`, `Message`, `add_messages`, `Node`, `StateGraph`, `CompiledGraph`, `Checkpoint`, `BaseCheckpointSaver`, `StreamMode`, `StreamEvent`, `Send`, `Command`, and **`MemorySaver`** if `memory-checkpoint` is on.
+
+**If `prebuilt`:** `create_react_agent`, `Tool`, `ToolNode`.
+
+**If any LLM feature (`openai` \| `openrouter` \| `anthropic` \| `ollama`):** `ChatModel` in the prelude.
+
+Otherwise import traits explicitly, e.g. `use rust_langgraph::llm::ChatModel` only compiles when an LLM feature is enabled.
+
+---
+
+## Common mistakes & compile errors
+
+| Symptom | Cause | Fix |
+|---------|--------|-----|
+| `could not find llm::ollama` | Feature off | Add `features = ["ollama"]` (or the adapter you need) |
+| `ChatModel` not found in prelude | No LLM feature | Enable `ollama`, `openai`, `openrouter`, or `anthropic` |
+| `create_react_agent` not found | Feature off | Add `features = ["prebuilt"]` |
+| Wrong crate in `use` | Confusion with Python | Use **`rust_langgraph`**, not `langgraph` |
+| Lifetime errors in conditional edges | Capturing `&state` into `async move` | Clone needed fields before the async block (see `AGENTS.md`) |
+| `invoke` borrow errors | Missing `mut` | `let mut app = graph.compile(...)?` |
+| Example fails to link | Wrong features | Use the `--features` from the [examples table](#examples) |
+
+---
+
+## Verification commands
+
+From the crate root (`rust-langgraph/`):
+
+```bash
+cargo check -p rust-langgraph
+cargo check -p rust-langgraph --all-features
+cargo test -p rust-langgraph --lib
+cargo doc -p rust-langgraph --no-deps --open
+```
+
+**Integration tests** (real Ollama server; marked `ignore`):
+
+```bash
+cargo test -p rust-langgraph --test test_ollama_integration --features ollama,prebuilt -- --ignored
+```
+
+**Run a single example:**
+
+```bash
+cargo run -p rust-langgraph --example simple_graph
+cargo run -p rust-langgraph --example ollama_chat --features ollama
+```
 
 ---
 
@@ -301,9 +480,10 @@ src/
   prebuilt/           # ReAct agent, tools (feature-gated)
 examples/             # Runnable examples (see table below)
 tests/                # Integration tests (e.g. Ollama, --ignored)
+AGENTS.md             # Short agent/contributor cheat sheet
 ```
 
-**Full API details:** run `cargo doc --open` or visit [docs.rs/rust-langgraph](https://docs.rs/rust-langgraph).
+**API reference:** [docs.rs/rust-langgraph](https://docs.rs/rust-langgraph) or `cargo doc --open`.
 
 ---
 
@@ -325,7 +505,13 @@ cd rust-langgraph
 cargo run --example simple_graph
 cargo run --example ollama_chat --features ollama
 cargo run --example react_agent_ollama --features ollama,prebuilt
-set OPENROUTER_API_KEY=sk-or-v1-...
+
+# OpenRouter (Windows PowerShell)
+$env:OPENROUTER_API_KEY = "sk-or-v1-..."
+cargo run --example openrouter_chat --features openrouter
+
+# OpenRouter (Unix)
+export OPENROUTER_API_KEY=sk-or-v1-...
 cargo run --example openrouter_chat --features openrouter
 ```
 
@@ -333,8 +519,11 @@ cargo run --example openrouter_chat --features openrouter
 
 ## Documentation
 
-- **Human readers:** this README + **[`AGENTS.md`](AGENTS.md)** (also useful for contributors) + **rustdoc** (`cargo doc --no-deps --open`).
-- **AI coding agents:** read **`AGENTS.md`** first — it lists crate name, features, patterns, and pitfalls so assistants generate correct `rust-langgraph` code.
+- **README (this file)** — install, env vars, features, recipes, troubleshooting.
+- **[`AGENTS.md`](AGENTS.md)** — condensed rules for contributors and **AI coding agents** (naming, signatures, pitfalls).
+- **Rustdoc** — `cargo doc -p rust-langgraph --no-deps --open`.
+
+When publishing a fork, update the `repository` URL in `Cargo.toml` to your Git host.
 
 ---
 
