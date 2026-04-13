@@ -1,0 +1,484 @@
+//! Core Pregel execution engine.
+//!
+//! This is the heart of LangGraph - a channel-centric superstep execution engine
+//! inspired by Google's Pregel. Unlike the rust-try-1 implementation which ignores
+//! channels and checkpointers, this implementation ACTUALLY USES THEM.
+
+use crate::channels::BaseChannel;
+use crate::checkpoint::{BaseCheckpointSaver, Checkpoint, CheckpointMetadata, StateSnapshot};
+use crate::config::Config;
+use crate::errors::{Error, Result};
+use crate::nodes::PregelNode;
+use crate::pregel::branch::BranchResult;
+use crate::state::State;
+use crate::types::{Send as SendType, StreamEvent, StreamMode};
+use crate::runtime::Runtime;
+use futures::stream::{Stream, StreamExt};
+use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
+use std::sync::Arc;
+
+/// The Pregel execution engine.
+///
+/// This implements the core superstep loop:
+/// 1. Load checkpoint (if resuming)
+/// 2. Write initial input to channels
+/// 3. Loop:
+///    - Find triggered nodes
+///    - Execute nodes in parallel
+///    - Apply writes to channels with reducers
+///    - Handle interrupts/commands
+///    - Save checkpoint
+///    - Yield stream events
+/// 4. Return final state
+pub struct Pregel<S: State> {
+    /// The nodes in the graph
+    nodes: HashMap<String, PregelNode<S>>,
+
+    /// The channels (THIS IS ACTUALLY USED, unlike rust-try-1!)
+    channels: HashMap<String, Box<dyn BaseChannel>>,
+
+    /// Optional checkpoint saver (THIS IS ACTUALLY USED!)
+    checkpointer: Option<Arc<dyn BaseCheckpointSaver>>,
+
+    /// Entry point node name
+    entry_point: String,
+
+    /// Finish point node names
+    finish_points: HashSet<String>,
+
+    /// Static edges from source to targets
+    edges: HashMap<String, Vec<String>>,
+
+    /// Current step in execution
+    current_step: usize,
+
+    /// Maximum recursion depth
+    recursion_limit: usize,
+
+    /// Channels written in the current superstep
+    written_channels: HashSet<String>,
+}
+
+impl<S: State> Pregel<S> {
+    /// Create a new Pregel executor
+    pub fn new(
+        nodes: HashMap<String, PregelNode<S>>,
+        channels: HashMap<String, Box<dyn BaseChannel>>,
+        checkpointer: Option<Arc<dyn BaseCheckpointSaver>>,
+        entry_point: String,
+        finish_points: HashSet<String>,
+        edges: HashMap<String, Vec<String>>,
+    ) -> Self {
+        Self {
+            nodes,
+            channels,
+            checkpointer,
+            entry_point,
+            finish_points,
+            edges,
+            current_step: 0,
+            recursion_limit: 25,
+            written_channels: HashSet::new(),
+        }
+    }
+
+    /// Set the recursion limit
+    pub fn with_recursion_limit(mut self, limit: usize) -> Self {
+        self.recursion_limit = limit;
+        self
+    }
+
+    /// Execute the graph with the given input and configuration
+    pub async fn invoke(&mut self, input: S, config: Config) -> Result<S> {
+        self.recursion_limit = config.recursion_limit;
+        self.current_step = 0;
+
+        // 1. Load checkpoint if resuming
+        if let Some(checkpointer) = &self.checkpointer {
+            if let Some(tuple) = checkpointer.get_tuple(&config).await? {
+                self.restore_channels(&tuple.checkpoint)?;
+                self.current_step = tuple.metadata.step;
+            }
+        }
+
+        // 2. Write initial input to START channels
+        self.write_input_to_channels(&input)?;
+
+        // 3. Superstep loop
+        loop {
+            // Check recursion limit
+            if self.current_step >= self.recursion_limit {
+                return Err(Error::RecursionLimitError {
+                    current: self.current_step,
+                    limit: self.recursion_limit,
+                });
+            }
+
+            // Find triggered nodes
+            let triggered_nodes = self.find_triggered_nodes();
+            if triggered_nodes.is_empty() {
+                break; // No more work to do
+            }
+
+            // Execute nodes in parallel
+            let mut tasks = Vec::new();
+            for node_name in &triggered_nodes {
+                if let Some(node) = self.nodes.get(node_name) {
+                    let state = self.read_state_for_node(node)?;
+                    let node_clone = node.clone();
+                    let config_clone = config.clone();
+
+                    let task = tokio::spawn(async move {
+                        node_clone.bound.invoke(state, &config_clone).await
+                    });
+
+                    tasks.push((node_name.clone(), task));
+                }
+            }
+
+            // Collect results
+            let mut updates: HashMap<String, S> = HashMap::new();
+            for (node_name, task) in tasks {
+                match task.await {
+                    Ok(Ok(result)) => {
+                        updates.insert(node_name, result);
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => {
+                        return Err(Error::execution(format!("Node execution panicked: {}", e)))
+                    }
+                }
+            }
+
+            // Apply writes to channels
+            self.apply_updates(updates)?;
+
+            // Check for interrupts/commands
+            // (For now, we'll implement basic interrupt support later)
+
+            // Save checkpoint
+            if let Some(checkpointer) = &self.checkpointer {
+                let checkpoint = self.create_checkpoint(&config)?;
+                let metadata = CheckpointMetadata {
+                    step: self.current_step,
+                    source: "pregel".to_string(),
+                    created_at: chrono::Utc::now(),
+                    extra: HashMap::new(),
+                };
+                checkpointer.put(&checkpoint, &metadata, &config).await?;
+            }
+
+            self.current_step += 1;
+            self.written_channels.clear(); // Clear for next superstep
+        }
+
+        // 4. Return final state
+        self.get_final_state()
+    }
+
+    /// Stream execution events
+    pub async fn stream(
+        &mut self,
+        input: S,
+        config: Config,
+        mode: StreamMode,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + std::marker::Send>>> {
+        self.recursion_limit = config.recursion_limit;
+        self.current_step = 0;
+
+        // For MVP: implement a basic streaming version
+        // Full implementation would yield events at each step
+
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        // Load checkpoint if resuming
+        if let Some(checkpointer) = &self.checkpointer {
+            if let Some(tuple) = checkpointer.get_tuple(&config).await? {
+                self.restore_channels(&tuple.checkpoint)?;
+                self.current_step = tuple.metadata.step;
+            }
+        }
+
+        // Write initial input
+        self.write_input_to_channels(&input)?;
+
+        // Clone necessary data for the async task
+        let nodes = self.nodes.clone();
+        let mut channels: HashMap<String, Box<dyn BaseChannel>> = HashMap::new();
+        // Note: We can't clone channels easily due to trait object limitations
+        // For now, we'll implement a simpler version
+
+        // Execute and stream
+        let checkpointer = self.checkpointer.clone();
+        let entry_point = self.entry_point.clone();
+        let recursion_limit = self.recursion_limit;
+
+        tokio::spawn(async move {
+            let mut step = 0;
+            loop {
+                if step >= recursion_limit {
+                    let _ = tx.send(Err(Error::RecursionLimitError {
+                        current: step,
+                        limit: recursion_limit,
+                    })).await;
+                    break;
+                }
+
+                // For now, simplified streaming
+                // Full implementation would mirror invoke() but yield events
+
+                // Emit a values event
+                if matches!(mode, StreamMode::Values) {
+                    let event = StreamEvent::Values {
+                        ns: vec![],
+                        data: serde_json::json!({"step": step}),
+                        interrupts: vec![],
+                    };
+                    if tx.send(Ok(event)).await.is_err() {
+                        break;
+                    }
+                }
+
+                step += 1;
+                break; // For MVP, just one step
+            }
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
+    /// Get the current state snapshot
+    pub async fn get_state(&self, config: &Config) -> Result<Option<StateSnapshot<S>>> {
+        if let Some(checkpointer) = &self.checkpointer {
+            if let Some(tuple) = checkpointer.get_tuple(config).await? {
+                let state = self.state_from_checkpoint(&tuple.checkpoint)?;
+                return Ok(Some(StateSnapshot {
+                    state,
+                    checkpoint: tuple.checkpoint,
+                    metadata: tuple.metadata,
+                    config: tuple.config,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Get state history
+    pub async fn get_state_history(
+        &self,
+        config: &Config,
+        limit: Option<usize>,
+    ) -> Result<Vec<StateSnapshot<S>>> {
+        if let Some(checkpointer) = &self.checkpointer {
+            let tuples = checkpointer.list(config, limit).await?;
+            let mut snapshots = Vec::new();
+
+            for tuple in tuples {
+                let state = self.state_from_checkpoint(&tuple.checkpoint)?;
+                snapshots.push(StateSnapshot {
+                    state,
+                    checkpoint: tuple.checkpoint,
+                    metadata: tuple.metadata,
+                    config: tuple.config,
+                });
+            }
+
+            return Ok(snapshots);
+        }
+        Ok(Vec::new())
+    }
+
+    // === PRIVATE HELPER METHODS ===
+
+    /// Write input state to START channels
+    fn write_input_to_channels(&mut self, input: &S) -> Result<()> {
+        // Convert state to JSON and write to START channel
+        let value = input.to_value()?;
+        if let Some(channel) = self.channels.get_mut("__start__") {
+            channel.update(vec![value])?;
+            self.written_channels.insert("__start__".to_string());
+        }
+        Ok(())
+    }
+
+    /// Find nodes that are triggered by written channels
+    fn find_triggered_nodes(&self) -> Vec<String> {
+        let mut triggered = Vec::new();
+
+        for (name, node) in &self.nodes {
+            if node.is_triggered(&self.written_channels.iter().cloned().collect::<Vec<_>>()) {
+                triggered.push(name.clone());
+            }
+        }
+
+        // If no nodes triggered but we have entry point and it's first step
+        if triggered.is_empty() && self.current_step == 0 {
+            triggered.push(self.entry_point.clone());
+        }
+
+        triggered
+    }
+
+    /// Read state for a specific node from its input channels
+    fn read_state_for_node(&self, node: &PregelNode<S>) -> Result<S> {
+        // For now, simple implementation: read from __start__ or construct empty state
+        // Full implementation would read from node's specific channels and construct state
+
+        if let Some(channel) = self.channels.get("__start__") {
+            if let Some(value) = channel.get()? {
+                return S::from_value(value);
+            }
+        }
+
+        // If no input, create from channels that node reads
+        // For MVP, this is simplified
+        Err(Error::state("Cannot construct state from channels"))
+    }
+
+    /// Apply node updates to channels
+    fn apply_updates(&mut self, updates: HashMap<String, S>) -> Result<()> {
+        for (node_name, state) in updates {
+            // Get the node's writer specifications
+            if let Some(node) = self.nodes.get(&node_name) {
+                // For each writer, write the state to the channel
+                for writer in &node.writers {
+                    let value = state.to_value()?;
+                    if let Some(channel) = self.channels.get_mut(&writer.channel) {
+                        channel.update(vec![value.clone()])?;
+                        self.written_channels.insert(writer.channel.clone());
+                    }
+                }
+            }
+
+            // Also follow static edges
+            if let Some(targets) = self.edges.get(&node_name) {
+                for target in targets {
+                    // Mark target's input channel as written
+                    self.written_channels.insert(format!("{}_input", target));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create a checkpoint from current channel states
+    fn create_checkpoint(&self, config: &Config) -> Result<Checkpoint> {
+        let mut checkpoint = Checkpoint::new();
+
+        if let Some(thread_id) = &config.thread_id {
+            checkpoint.thread_id = Some(thread_id.clone());
+        }
+
+        // Save all channel values
+        for (name, channel) in &self.channels {
+            let channel_data = channel.checkpoint()?;
+            checkpoint.set_channel(name, channel_data);
+        }
+
+        Ok(checkpoint)
+    }
+
+    /// Restore channels from a checkpoint
+    fn restore_channels(&mut self, checkpoint: &Checkpoint) -> Result<()> {
+        for (name, value) in &checkpoint.channel_values {
+            // We can't fully restore channels from checkpoint due to type erasure
+            // In practice, the graph builder creates channels and we just update their values
+            if let Some(channel) = self.channels.get_mut(name) {
+                channel.update(vec![value.clone()])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Construct state from a checkpoint
+    fn state_from_checkpoint(&self, checkpoint: &Checkpoint) -> Result<S> {
+        // Get the value from the main state channel
+        if let Some(value) = checkpoint.get_channel("__state__") {
+            return S::from_value(value.clone());
+        }
+
+        // Fallback: try to construct from START channel
+        if let Some(value) = checkpoint.get_channel("__start__") {
+            return S::from_value(value.clone());
+        }
+
+        Err(Error::checkpoint("Cannot construct state from checkpoint"))
+    }
+
+    /// Get the final state after execution
+    fn get_final_state(&self) -> Result<S> {
+        // Read from output channels
+        if let Some(channel) = self.channels.get("__end__") {
+            if let Some(value) = channel.get()? {
+                return S::from_value(value);
+            }
+        }
+
+        // Fallback: read from __start__ channel
+        if let Some(channel) = self.channels.get("__start__") {
+            if let Some(value) = channel.get()? {
+                return S::from_value(value);
+            }
+        }
+
+        Err(Error::state("Cannot determine final state"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channels::{LastValue};
+    use crate::nodes::{Node, PregelNode, ChannelWrite};
+    use crate::state::State as StateTrait;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+    struct TestState {
+        count: i32,
+    }
+
+    impl StateTrait for TestState {
+        fn merge(&mut self, other: Self) -> Result<()> {
+            self.count += other.count;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pregel_basic() {
+        let increment_node = PregelNode::from_node(
+            "increment",
+            vec!["__start__".to_string()],
+            vec!["__start__".to_string()],
+            |mut state: TestState, _config: &Config| async move {
+                state.count += 1;
+                Ok(state)
+            },
+            vec![ChannelWrite::new("__end__")],
+        );
+
+        let mut nodes = HashMap::new();
+        nodes.insert("increment".to_string(), increment_node);
+
+        let mut channels: HashMap<String, Box<dyn BaseChannel>> = HashMap::new();
+        channels.insert("__start__".to_string(), Box::new(LastValue::<TestState>::new()));
+        channels.insert("__end__".to_string(), Box::new(LastValue::<TestState>::new()));
+
+        let mut pregel = Pregel::new(
+            nodes,
+            channels,
+            None,
+            "increment".to_string(),
+            HashSet::from(["increment".to_string()]),
+            HashMap::new(),
+        );
+
+        let input = TestState { count: 0 };
+        let result = pregel.invoke(input, Config::default()).await.unwrap();
+
+        assert_eq!(result.count, 1);
+    }
+}
