@@ -86,6 +86,18 @@ Use it for multi-step LLM apps, tool-calling agents, branching pipelines, and an
 
 ## Installation
 
+### From crates.io (use in another project)
+
+**[`rust-langgraph` on crates.io](https://crates.io/crates/rust-langgraph)** — add it like any other dependency:
+
+```bash
+cargo add rust-langgraph
+# Optional features, e.g. Ollama + ReAct:
+# cargo add rust-langgraph --features ollama,prebuilt
+```
+
+Rustdoc is on **[docs.rs/rust-langgraph](https://docs.rs/rust-langgraph)** (may take a few minutes to build right after the first publish).
+
 **Minimal `Cargo.toml`** (graph core only — checkpoints in memory):
 
 ```toml
@@ -523,7 +535,7 @@ cargo run --example openrouter_chat --features openrouter
 - **[`AGENTS.md`](AGENTS.md)** — condensed rules for contributors and **AI coding agents** (naming, signatures, pitfalls).
 - **Rustdoc** — `cargo doc -p rust-langgraph --no-deps --open`.
 
-When publishing a fork, update the `repository` URL in `Cargo.toml` to your Git host.
+The crate’s `repository` in `Cargo.toml` points to [github.com/kareem2002-k/rust-langgraph](https://github.com/kareem2002-k/rust-langgraph); change it if you maintain a fork.
 
 ---
 

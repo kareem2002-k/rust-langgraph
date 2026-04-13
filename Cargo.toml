@@ -12,7 +12,7 @@ Enable Cargo features explicitly for LLM modules (e.g. ollama, openai, openroute
 See README.md on crates.io for copy-paste Cargo.toml, env vars, and common mistakes.
 """
 license = "MIT"
-repository = "https://github.com/yourusername/rust-langgraph"
+repository = "https://github.com/kareem2002-k/rust-langgraph"
 documentation = "https://docs.rs/rust-langgraph"
 keywords = ["langgraph", "llm", "agent", "workflow", "async"]
 categories = ["asynchronous", "web-programming"]
