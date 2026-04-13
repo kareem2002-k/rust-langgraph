@@ -12,7 +12,7 @@
 //! - **BinaryOperatorAggregate**: Reduces multiple writes with a custom function
 //! - **EphemeralValue**: Cleared after each superstep
 
-use crate::errors::{Error, Result};
+use crate::errors::Result;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 

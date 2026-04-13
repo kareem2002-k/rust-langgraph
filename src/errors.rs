@@ -4,7 +4,6 @@
 //! detailed context for various failure modes in graph execution, checkpointing,
 //! and state management.
 
-use std::fmt;
 
 /// The main error type for LangGraph operations.
 #[derive(Debug, thiserror::Error)]

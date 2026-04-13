@@ -16,6 +16,7 @@ memory-checkpoint = []
 sqlite = ["dep:sqlx", "sqlx/sqlite", "sqlx/runtime-tokio"]
 postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/runtime-tokio"]
 openai = ["dep:reqwest", "dep:async-openai"]
+openrouter = ["dep:reqwest", "dep:async-openai"]
 anthropic = ["dep:reqwest"]
 ollama = ["dep:reqwest"]
 prebuilt = []
@@ -89,4 +90,9 @@ required-features = ["ollama", "prebuilt"]
 [[example]]
 name = "custom_state"
 path = "examples/08_custom_state.rs"
+
+[[example]]
+name = "openrouter_chat"
+path = "examples/07_openrouter_chat.rs"
+required-features = ["openrouter"]
 

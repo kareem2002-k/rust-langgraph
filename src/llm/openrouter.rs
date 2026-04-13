@@ -1,7 +1,13 @@
-//! OpenAI adapter using the async-openai crate.
+//! OpenRouter adapter — unified API for many models via OpenAI-compatible endpoints.
 //!
-//! Provides integration with OpenAI's Chat Completion API including
-//! support for function calling and tool use.
+//! OpenRouter exposes an OpenAI-compatible Chat Completions API at
+//! `https://openrouter.ai/api/v1`. Use `Authorization: Bearer <OPENROUTER_API_KEY>` and
+//! model IDs such as `openai/gpt-4o` or `anthropic/claude-3.5-sonnet`.
+//!
+//! See [OpenRouter quickstart](https://openrouter.ai/docs/quickstart).
+//!
+//! Optional headers (`HTTP-Referer`, `X-OpenRouter-Title`) for app attribution are not
+//! set by this adapter yet; the API works without them.
 
 use crate::errors::{Error, Result};
 use crate::llm::{ChatModel, ToolInfo};
@@ -11,56 +17,71 @@ use async_openai::{
     types::{
         ChatCompletionRequestAssistantMessage, ChatCompletionRequestMessage,
         ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestUserMessage, ChatCompletionTool, ChatCompletionToolType,
-        CreateChatCompletionRequestArgs, FunctionObject,
+        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+        ChatCompletionTool, ChatCompletionToolType, CreateChatCompletionRequestArgs,
+        FunctionObject,
     },
     Client,
 };
 use async_trait::async_trait;
 
-/// OpenAI adapter implementing ChatModel trait.
-///
-/// Supports all OpenAI chat models including GPT-4, GPT-3.5, etc.
+/// Default OpenRouter API base (OpenAI-compatible).
+pub const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
+
+/// OpenRouter adapter implementing [`ChatModel`].
 ///
 /// # Example
 ///
 /// ```rust,no_run
-/// use rust_langgraph::llm::openai::OpenAIAdapter;
+/// use rust_langgraph::llm::openrouter::OpenRouterAdapter;
 /// use rust_langgraph::llm::ChatModel;
 /// use rust_langgraph::state::Message;
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     let adapter = OpenAIAdapter::with_api_key("gpt-4", "sk-...");
+///     let adapter = OpenRouterAdapter::with_api_key(
+///         "openai/gpt-4o-mini",
+///         std::env::var("OPENROUTER_API_KEY").unwrap(),
+///     );
 ///     let messages = vec![Message::user("Hello!")];
 ///     let response = adapter.invoke(&messages).await.unwrap();
 ///     println!("{}", response.content);
 /// }
 /// ```
 #[derive(Clone)]
-pub struct OpenAIAdapter {
+pub struct OpenRouterAdapter {
     client: Client<OpenAIConfig>,
     model: String,
     temperature: Option<f32>,
     bound_tools: Vec<ToolInfo>,
 }
 
-impl OpenAIAdapter {
-    /// Create a new OpenAI adapter using the default API key from environment.
-    ///
-    /// Reads API key from `OPENAI_API_KEY` environment variable.
+impl OpenRouterAdapter {
+    /// Build config: OpenRouter base URL + API key from `OPENROUTER_API_KEY` (may be empty).
+    fn config_from_env() -> OpenAIConfig {
+        OpenAIConfig::new()
+            .with_api_key(
+                std::env::var("OPENROUTER_API_KEY").unwrap_or_else(|_| String::new()),
+            )
+            .with_api_base(OPENROUTER_API_BASE)
+    }
+
+    /// New adapter using `OPENROUTER_API_KEY` from the environment and the given model id
+    /// (e.g. `openai/gpt-4o-mini`).
     pub fn new(model: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::with_config(Self::config_from_env()),
             model: model.into(),
             temperature: None,
             bound_tools: Vec::new(),
         }
     }
 
-    /// Create adapter with custom API key.
+    /// Explicit API key (recommended for clarity).
     pub fn with_api_key(model: impl Into<String>, api_key: impl Into<String>) -> Self {
-        let config = OpenAIConfig::new().with_api_key(api_key);
+        let config = OpenAIConfig::new()
+            .with_api_key(api_key)
+            .with_api_base(OPENROUTER_API_BASE);
 
         Self {
             client: Client::with_config(config),
@@ -70,19 +91,34 @@ impl OpenAIAdapter {
         }
     }
 
-    /// Set temperature for generation (0.0 - 2.0).
+    /// Custom API base (proxy or future OpenRouter URL change). Most users should use defaults.
+    pub fn with_api_base(
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+        api_base: impl Into<String>,
+    ) -> Self {
+        let config = OpenAIConfig::new()
+            .with_api_key(api_key)
+            .with_api_base(api_base);
+
+        Self {
+            client: Client::with_config(config),
+            model: model.into(),
+            temperature: None,
+            bound_tools: Vec::new(),
+        }
+    }
+
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
     }
 
-    /// Bind tools to this model for function calling.
     pub fn bind_tools(mut self, tools: Vec<ToolInfo>) -> Self {
         self.bound_tools = tools;
         self
     }
 
-    /// Convert our Message to OpenAI message format.
     fn to_openai_message(msg: &Message) -> ChatCompletionRequestMessage {
         use async_openai::types::{
             ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestSystemMessageContent,
@@ -137,25 +173,21 @@ impl OpenAIAdapter {
                 tool_call_id: msg.tool_call_id.clone().unwrap_or_default(),
                 ..Default::default()
             }),
-            _ => {
-                // Default to user message for unknown roles
-                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                    content: msg.content.clone().into(),
-                    name: msg.name.clone(),
-                    ..Default::default()
-                })
-            }
+            _ => ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: msg.content.clone().into(),
+                name: msg.name.clone(),
+                ..Default::default()
+            }),
         }
     }
 
-    /// Convert OpenAI response to our Message format.
     fn from_openai_response(
         response: async_openai::types::CreateChatCompletionResponse,
     ) -> Result<Message> {
         let choice = response
             .choices
             .first()
-            .ok_or_else(|| Error::execution("No response from OpenAI"))?;
+            .ok_or_else(|| Error::execution("No response from OpenRouter"))?;
 
         let content = choice.message.content.clone().unwrap_or_default();
         let tool_calls: Vec<ToolCall> = choice
@@ -181,7 +213,6 @@ impl OpenAIAdapter {
         }
     }
 
-    /// Convert ToolInfo to OpenAI tool format.
     fn to_openai_tool(tool: &ToolInfo) -> ChatCompletionTool {
         ChatCompletionTool {
             r#type: ChatCompletionToolType::Function,
@@ -196,7 +227,7 @@ impl OpenAIAdapter {
 }
 
 #[async_trait]
-impl ChatModel for OpenAIAdapter {
+impl ChatModel for OpenRouterAdapter {
     async fn invoke(&self, messages: &[Message]) -> Result<Message> {
         let openai_messages: Vec<_> = messages.iter().map(Self::to_openai_message).collect();
 
@@ -208,7 +239,6 @@ impl ChatModel for OpenAIAdapter {
             request.temperature(temp);
         }
 
-        // Add tools if bound
         if !self.bound_tools.is_empty() {
             let tools: Vec<_> = self.bound_tools.iter().map(Self::to_openai_tool).collect();
             request.tools(tools);
@@ -216,14 +246,14 @@ impl ChatModel for OpenAIAdapter {
 
         let request = request
             .build()
-            .map_err(|e| Error::execution(format!("Failed to build OpenAI request: {}", e)))?;
+            .map_err(|e| Error::execution(format!("Failed to build OpenRouter request: {}", e)))?;
 
         let response = self
             .client
             .chat()
             .create(request)
             .await
-            .map_err(|e| Error::execution(format!("OpenAI API error: {}", e)))?;
+            .map_err(|e| Error::execution(format!("OpenRouter API error: {}", e)))?;
 
         Self::from_openai_response(response)
     }
@@ -242,87 +272,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_adapter_creation() {
-        let adapter = OpenAIAdapter::new("gpt-4");
-        assert_eq!(adapter.model, "gpt-4");
-        assert_eq!(adapter.name(), "gpt-4");
+    fn test_default_base_constant() {
+        assert!(OPENROUTER_API_BASE.contains("openrouter.ai"));
     }
 
     #[test]
-    fn test_with_temperature() {
-        let adapter = OpenAIAdapter::new("gpt-4").with_temperature(0.5);
-        assert_eq!(adapter.temperature, Some(0.5));
+    fn test_with_api_key() {
+        let a = OpenRouterAdapter::with_api_key("openai/gpt-4o-mini", "sk-or-test");
+        assert_eq!(a.name(), "openai/gpt-4o-mini");
     }
 
     #[test]
-    fn test_message_conversion_user() {
-        let msg = Message::user("Hello");
-        let openai_msg = OpenAIAdapter::to_openai_message(&msg);
-
-        match openai_msg {
-            ChatCompletionRequestMessage::User(user_msg) => match user_msg.content {
-                async_openai::types::ChatCompletionRequestUserMessageContent::Text(s) => {
-                    assert_eq!(s, "Hello");
-                }
-                async_openai::types::ChatCompletionRequestUserMessageContent::Array(_) => {
-                    panic!("Expected text user content");
+    fn test_user_message_roundtrip_shape() {
+        let msg = Message::user("Hi");
+        let m = OpenRouterAdapter::to_openai_message(&msg);
+        match m {
+            ChatCompletionRequestMessage::User(u) => match u.content {
+                ChatCompletionRequestUserMessageContent::Text(s) => assert_eq!(s, "Hi"),
+                ChatCompletionRequestUserMessageContent::Array(_) => {
+                    panic!("expected text user content")
                 }
             },
-            _ => panic!("Expected user message"),
+            _ => panic!("expected user"),
         }
-    }
-
-    #[test]
-    fn test_message_conversion_assistant_with_tools() {
-        let msg = Message::assistant("Let me search").with_tool_calls(vec![ToolCall::new(
-            "call-1",
-            "search",
-            serde_json::json!({"query": "rust"}),
-        )]);
-
-        let openai_msg = OpenAIAdapter::to_openai_message(&msg);
-
-        match openai_msg {
-            ChatCompletionRequestMessage::Assistant(asst_msg) => {
-                assert!(asst_msg.tool_calls.is_some());
-                let calls = asst_msg.tool_calls.unwrap();
-                assert_eq!(calls.len(), 1);
-                assert_eq!(calls[0].function.name, "search");
-            }
-            _ => panic!("Expected assistant message"),
-        }
-    }
-
-    #[test]
-    fn test_tool_message_conversion() {
-        let msg = Message::tool("Result: found!", "call-1");
-        let openai_msg = OpenAIAdapter::to_openai_message(&msg);
-
-        match openai_msg {
-            ChatCompletionRequestMessage::Tool(tool_msg) => {
-                assert_eq!(tool_msg.content, "Result: found!");
-                assert_eq!(tool_msg.tool_call_id, "call-1");
-            }
-            _ => panic!("Expected tool message"),
-        }
-    }
-
-    #[test]
-    fn test_tool_info_conversion() {
-        let tool_info = ToolInfo::new(
-            "search",
-            "Search the web",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"}
-                }
-            }),
-        );
-
-        let openai_tool = OpenAIAdapter::to_openai_tool(&tool_info);
-
-        assert_eq!(openai_tool.function.name, "search");
-        assert_eq!(openai_tool.function.description, Some("Search the web".to_string()));
     }
 }

@@ -10,6 +10,9 @@ use std::pin::Pin;
 #[cfg(feature = "openai")]
 pub mod openai;
 
+#[cfg(feature = "openrouter")]
+pub mod openrouter;
+
 #[cfg(feature = "anthropic")]
 pub mod anthropic;
 

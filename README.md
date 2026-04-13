@@ -2,383 +2,370 @@
 
 <div align="center">
 
-**Graph-native LLM workflows in Rust — inspired by LangGraph, built by the community**
+**Graph-native LLM workflows in Rust — inspired by [LangGraph](https://github.com/langchain-ai/langgraph), built by the community**
 
 [![Crates.io](https://img.shields.io/crates/v/rust-langgraph.svg)](https://crates.io/crates/rust-langgraph)
 [![Documentation](https://docs.rs/rust-langgraph/badge.svg)](https://docs.rs/rust-langgraph)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-*This crate is **not** the official [LangGraph](https://github.com/langchain-ai/langgraph) from LangChain. It is an independent Rust port with a similar programming model.*
+*Not affiliated with LangChain. This is an independent Rust library with a similar programming model.*
 
 </div>
 
-## Overview
+---
 
-**Rust LangGraph** (`rust-langgraph` on crates.io) is a community library for building stateful, multi-actor applications with Large Language Models (LLMs). It provides a graph-based execution model inspired by Google’s Pregel and by LangGraph’s ideas, with checkpointing, streaming, and conditional routing.
+## Table of contents
 
-### Key Features
+1. [What this crate is](#what-this-crate-is)
+2. [Who should use it](#who-should-use-it)
+3. [Installation](#installation)
+4. [Five-minute tutorial](#five-minute-tutorial)
+5. [Core concepts](#core-concepts)
+6. [Graph API reference](#graph-api-reference)
+7. [LLMs and agents](#llms-and-agents)
+8. [Feature flags](#feature-flags)
+9. [Project layout](#project-layout)
+10. [Examples](#examples)
+11. [Docs for humans vs. tooling](#documentation)
+12. [Comparison with Python LangGraph](#comparison-with-python-langgraph)
+13. [License & acknowledgments](#license)
 
-- **🔄 Stateful Execution**: Build graphs where nodes communicate through shared state with automatic merging
-- **💾 Checkpointing**: Save and resume execution at any point with memory, SQLite, or PostgreSQL backends
-- **📡 Streaming**: Stream events as the graph executes for real-time feedback
-- **🔀 Conditional Logic**: Dynamic routing based on state with support for parallel execution
-- **🔁 Cycles**: Create feedback loops and iterative processes
-- **🧑‍💻 Human-in-the-Loop**: Pause execution for human input and resume seamlessly
-- **🚀 High Performance**: Built in Rust for speed and safety
-- **🔌 LLM Integration**: Built-in support for OpenAI, Anthropic, and Ollama
+---
 
-## Quick Start
+## What this crate is
 
-Add **rust-langgraph** to your `Cargo.toml`:
+**Rust LangGraph** (crate name: **`rust-langgraph`**, Rust import: **`rust_langgraph`**) helps you build **stateful workflows** as a **directed graph**:
+
+- **Nodes** are async functions (or types implementing `Node`) that read and return **state**.
+- **Edges** connect nodes: fixed edges or **conditional** edges that choose the next node from state.
+- **Execution** follows a Pregel-style loop: run nodes, merge state, optionally **checkpoint**, repeat until done.
+
+Use it for multi-step LLM apps, tool-calling agents, branching pipelines, and anything that fits “steps + shared state + optional loops.”
+
+---
+
+## Who should use it
+
+| You want… | Use… |
+|-----------|------|
+| A small graph without LLMs | `StateGraph` + custom `State` |
+| Chat + tools (ReAct-style) | `prebuilt` feature: `create_react_agent`, `Tool`, `ToolNode` |
+| Local models | `ollama` feature: `llm::ollama::OllamaAdapter` |
+| OpenAI / Anthropic APIs | `openai` / `anthropic` features under `rust_langgraph::llm` |
+| [OpenRouter](https://openrouter.ai/docs/quickstart) (many providers, one API) | `openrouter` feature: `llm::openrouter::OpenRouterAdapter` |
+| Persistence between runs | `MemorySaver` or DB backends (`sqlite` / `postgres` features) |
+
+---
+
+## Installation
+
+**`Cargo.toml`:**
 
 ```toml
 [dependencies]
 rust-langgraph = "0.1"
 tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+# Optional: use with `futures::StreamExt` when consuming `CompiledGraph::stream`
+futures = "0.3"
 ```
 
-### Simple Example
+**Import in Rust:**
+
+```rust
+use rust_langgraph::prelude::*;
+```
+
+Optional: enable features you need (see [Feature flags](#feature-flags)).
+
+**Requirements:**
+
+- Rust 2021 edition
+- Async runtime: **Tokio** (the library is async-first)
+
+---
+
+## Five-minute tutorial
+
+### 1. Define state
+
+State must implement [`State`](https://docs.rs/rust-langgraph/latest/rust_langgraph/state/trait.State.html): `Clone`, `Serialize`/`Deserialize`, `Debug`, and **`merge`** (how updates from multiple nodes combine).
 
 ```rust
 use rust_langgraph::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct MyState {
-    count: i32,
+struct AppState {
+    n: i32,
 }
 
-impl State for MyState {
-    fn merge(&mut self, other: Self) -> Result<(), Error> {
-        self.count += other.count;
+impl State for AppState {
+    fn merge(&mut self, other: Self) -> Result<()> {
+        self.n += other.n;
         Ok(())
     }
 }
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create a graph
-    let mut graph = StateGraph::new();
-    
-    // Add a node
-    graph.add_node("increment", |mut state: MyState, _config: &Config| async move {
-        state.count += 1;
-        Ok(state)
-    });
-    
-    graph.set_entry_point("increment");
-    graph.set_finish_point("increment");
-    
-    // Compile and run
-    let mut app = graph.compile(None)?;
-    let result = app.invoke(MyState { count: 0 }, Config::default()).await?;
-    
-    println!("Final count: {}", result.count); // Output: Final count: 1
-    Ok(())
-}
 ```
 
-## Core Concepts
-
-### StateGraph
-
-The `StateGraph` is the main way to build graphs. It uses a builder pattern to declaratively define nodes and edges:
+### 2. Build a graph
 
 ```rust
 let mut graph = StateGraph::new();
 
-graph.add_node("process", |state, _config| async move {
-    // Your logic here
-    Ok(state)
+graph.add_node("step", |state: AppState, _config: &Config| async move {
+    Ok(AppState { n: state.n + 1 })
 });
 
-graph.set_entry_point("process");
-graph.set_finish_point("process");
+graph.set_entry_point("step");
+graph.set_finish_point("step");
 
-let app = graph.compile(None)?;
+let mut app = graph.compile(None)?;
+let out = app.invoke(AppState { n: 0 }, Config::default()).await?;
+// out.n == 1
 ```
 
-### Nodes
+### 3. Conditional routing (optional)
 
-Nodes are the computational units. They take state and return updated state:
-
-```rust
-graph.add_node("my_node", |mut state: MyState, _config: &Config| async move {
-    state.value += 1;
-    Ok(state)
-});
-```
-
-### Edges
-
-Connect nodes with static or conditional edges:
+Use `pregel::BranchResult`: `single("node_id")`, `end()`, or more advanced variants.
 
 ```rust
-// Static edge
-graph.add_edge("node1", "node2");
+use rust_langgraph::pregel::BranchResult;
 
-// Conditional edge
-graph.add_conditional_edges("node1", |state: &MyState| async move {
-    if state.value > 10 {
-        Ok(BranchResult::single("node2"))
-    } else {
-        Ok(BranchResult::single("node3"))
+graph.add_conditional_edges("step", |state: &AppState| {
+    let n = state.n;
+    async move {
+        if n >= 3 {
+            Ok(BranchResult::end())
+        } else {
+            Ok(BranchResult::single("step"))
+        }
     }
 });
 ```
 
+---
+
+## Core concepts
+
+### Mental model
+
+1. You declare **nodes** by name and pass a closure or a type implementing `Node<S>`.
+2. You connect nodes with **`add_edge`** or **`add_conditional_edges`**.
+3. You set **`set_entry_point`** (where execution starts) and usually **`set_finish_point`** (terminal nodes).
+4. **`compile`** produces a **`CompiledGraph`** you call **`invoke`** or **`stream`** on.
+
+### State
+
+- **`State`** — your domain data; **`merge`** defines reducer semantics when multiple writes occur.
+- **`MessagesState`** — built-in chat history for LLM flows (`messages: Vec<Message>`).
+- **`Message`**, **`ToolCall`** — roles `user`, `assistant`, `system`, `tool`; tool calls and tool results.
+
+### Graph types
+
+| Type | Role |
+|------|------|
+| `StateGraph<S>` | Builder: `add_node`, `add_edge`, `add_conditional_edges`, `compile` |
+| `CompiledGraph<S>` | Runnable: `invoke`, `stream`, checkpoint helpers when configured |
+
 ### Checkpointing
 
-Save and resume execution with checkpointing:
-
-```rust
-use std::sync::Arc;
-
-// In-memory checkpointer (also available: SQLite, PostgreSQL)
-let checkpointer = Arc::new(MemorySaver::new());
-let app = graph.compile(Some(checkpointer))?;
-
-// Execute with a thread ID for checkpoint isolation
-let config = Config::new().with_thread_id("user-123");
-let result = app.invoke(initial_state, config.clone()).await?;
-
-// Resume from checkpoint
-let snapshot = app.get_state(&config).await?;
-```
+Pass a **`BaseCheckpointSaver`** (e.g. **`MemorySaver`** with feature `memory-checkpoint`) into **`compile(Some(checkpointer))`**. Use **`Config::with_thread_id`** so each conversation/thread has isolated checkpoints.
 
 ### Streaming
 
-Stream events as the graph executes:
+Use **`CompiledGraph::stream`** with **`StreamMode`** and handle **`StreamEvent`** variants. Add **`futures`** to your app for **`StreamExt`**:
 
 ```rust
-let mut stream = app.stream(initial_state, config, StreamMode::Values).await?;
+use futures::StreamExt;
+use rust_langgraph::prelude::*;
+
+// let mut app: CompiledGraph<MyState> = ...;
+let mut stream = app
+    .stream(initial_state, config, StreamMode::Values)
+    .await?;
 
 while let Some(event) = stream.next().await {
     match event? {
         StreamEvent::Values { data, .. } => {
-            println!("State update: {:?}", data);
+            println!("{:?}", data);
         }
         _ => {}
     }
 }
 ```
 
-## LLM Integration
+For token-level LLM streams, call **`ChatModel::stream`** on **`OllamaAdapter`** / **`OpenAIAdapter`** / **`OpenRouterAdapter`** / **`AnthropicAdapter`**.
 
-LangGraph includes built-in adapters for popular LLM providers:
+---
 
-### Ollama (Local Models)
+## Graph API reference
+
+| Method | Purpose |
+|--------|---------|
+| `StateGraph::new()` | Empty graph |
+| `add_node(name, node)` | Register a node (`impl Node<S>` or closure) |
+| `add_edge(from, to)` | Always go `from → to` |
+| `add_conditional_edges(from, branch)` | `branch` returns `BranchResult` (next node(s) or end) |
+| `set_entry_point(name)` | First node(s) to run |
+| `set_finish_point(name)` | Mark terminal nodes |
+| `compile(checkpointer)` | Build `CompiledGraph` |
+
+**Node closure shape:**
+
+```rust
+|state: S, config: &Config| async move { Result<S> }
+```
+
+Use an explicit `&Config` parameter (not `_`) if the compiler complains about lifetimes in complex graphs.
+
+---
+
+## LLMs and agents
+
+Enable features: **`ollama`**, **`openai`**, **`openrouter`**, **`anthropic`**, and often **`prebuilt`** for agents.
+
+### Direct chat (no graph)
+
+**Local (Ollama):**
 
 ```rust
 use rust_langgraph::llm::ollama::OllamaAdapter;
 use rust_langgraph::llm::ChatModel;
 use rust_langgraph::state::Message;
 
-let adapter = OllamaAdapter::new("llama3.1:8b");
-let messages = vec![Message::user("What is Rust?")];
-let response = adapter.invoke(&messages).await?;
-
-println!("Response: {}", response.content);
+let model = OllamaAdapter::new("llama3.1:8b");
+let reply = model.invoke(&[Message::user("Hello")]).await?;
 ```
 
-### OpenAI
+**OpenRouter** ([quickstart](https://openrouter.ai/docs/quickstart)) — OpenAI-compatible HTTP API; set `OPENROUTER_API_KEY` and use a router model id (e.g. `openai/gpt-4o-mini`):
 
 ```rust
-use rust_langgraph::llm::openai::OpenAIAdapter;
+use rust_langgraph::llm::openrouter::OpenRouterAdapter;
+use rust_langgraph::llm::ChatModel;
+use rust_langgraph::state::Message;
 
-let adapter = OpenAIAdapter::with_api_key("gpt-4", "sk-...");
-let messages = vec![Message::user("Explain async Rust")];
-let response = adapter.invoke(&messages).await?;
-```
-
-### Anthropic Claude
-
-```rust
-use rust_langgraph::llm::anthropic::AnthropicAdapter;
-
-let adapter = AnthropicAdapter::with_api_key("sk-ant-...")
-    .with_model("claude-3-5-sonnet-20241022");
-    
-let messages = vec![Message::user("Write a poem about Rust")];
-let response = adapter.invoke(&messages).await?;
-```
-
-### Tool Calling
-
-All adapters support function calling for agentic workflows:
-
-```rust
-use rust_langgraph::llm::ToolInfo;
-
-let search_tool = ToolInfo::new(
-    "search",
-    "Search the web",
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Search query"}
-        },
-        "required": ["query"]
-    })
+let model = OpenRouterAdapter::with_api_key(
+    "openai/gpt-4o-mini",
+    std::env::var("OPENROUTER_API_KEY").unwrap(),
 );
-
-let adapter = OllamaAdapter::new("llama3.1:8b")
-    .with_tools(vec![search_tool]);
+let reply = model.invoke(&[Message::user("Hello")]).await?;
 ```
 
-## Advanced Features
+### ReAct agent (graph with `agent` ↔ `tools` loop)
 
-### ReAct Agent Pattern
+1. Define **`Tool`** instances with **`Tool::new(...).with_schema(json_schema)`**.
+2. Bind the same tools to the model: e.g. **`OllamaAdapter::new(...).with_tools(vec![t.to_tool_info(), ...])`**.
+3. Call **`create_react_agent(model, tools)`** → get a **`CompiledGraph<MessagesState>`**.
+4. **`invoke(MessagesState { messages: vec![Message::user("...")] }, Config::default())`**.
 
-Create an agent that can use tools with real LLMs:
+See **`examples/06_react_agent_ollama.rs`** for a full runnable flow.
 
-```rust
-use rust_langgraph::prebuilt::{create_react_agent, Tool};
-use rust_langgraph::llm::ollama::OllamaAdapter;
+### Validation
 
-let search_tool = Tool::new(
-    "search",
-    "Search for information online",
-    |args| async move {
-        let query = args["query"].as_str().unwrap_or("");
-        // Your search implementation
-        Ok(serde_json::json!({"results": format!("Found info about: {}", query)}))
-    }
-).with_schema(serde_json::json!({
-    "type": "object",
-    "properties": {
-        "query": {"type": "string"}
-    },
-    "required": ["query"]
-}));
+**`prebuilt::validate_chat_history`** checks that every assistant **`tool_calls`** entry has a matching **`tool`** message (aligned with common LangGraph-style rules).
 
-// Create model with tools
-let model = OllamaAdapter::new("llama3.1:8b")
-    .with_tools(vec![search_tool.to_tool_info()]);
+---
 
-// Create ReAct agent
-let agent = create_react_agent(model, vec![search_tool])?;
-
-// Use the agent
-let result = agent.invoke(
-    MessagesState {
-        messages: vec![Message::user("Search for Rust tutorials and summarize")]
-    },
-    Config::default()
-).await?;
-```
-
-### Custom State Types
-
-Define your own state with custom merge logic:
-
-```rust
-#[derive(Clone, Serialize, Deserialize)]
-struct CustomState {
-    counter: i32,
-    items: Vec<String>,
-}
-
-impl State for CustomState {
-    fn merge(&mut self, other: Self) -> Result<()> {
-        self.counter += other.counter;
-        self.items.extend(other.items);
-        Ok(())
-    }
-}
-```
-
-## Feature Flags
-
-Enable optional features in your `Cargo.toml`:
+## Feature flags
 
 ```toml
-[dependencies]
-rust-langgraph = { version = "0.1", features = ["sqlite", "openai", "prebuilt"] }
+rust-langgraph = { version = "0.1", features = ["ollama", "prebuilt", "openai", "openrouter"] }
 ```
 
-Available features:
+| Feature | What it enables |
+|---------|------------------|
+| `memory-checkpoint` | **Default.** In-memory `MemorySaver` |
+| `sqlite` | SQLite checkpoint backend (`sqlx`) |
+| `postgres` | PostgreSQL checkpoint backend |
+| `openai` | `llm::openai::OpenAIAdapter` + `reqwest` + `async-openai` |
+| `openrouter` | `llm::openrouter::OpenRouterAdapter` (OpenAI-compatible client → `https://openrouter.ai/api/v1`) |
+| `anthropic` | `llm::anthropic::AnthropicAdapter` |
+| `ollama` | `llm::ollama::OllamaAdapter` |
+| `prebuilt` | `create_react_agent`, `Tool`, `ToolNode`, `validate_chat_history` |
 
-- `memory-checkpoint` (default): In-memory checkpointing
-- `sqlite`: SQLite checkpoint backend
-- `postgres`: PostgreSQL checkpoint backend
-- `openai`: OpenAI API integration
-- `anthropic`: Anthropic API integration
-- `ollama`: Ollama API integration
-- `prebuilt`: Prebuilt agent patterns (ReAct, etc.)
+---
 
-## Architecture
+## Project layout
 
-Rust LangGraph uses a **channel-centric superstep execution** model:
+```
+src/
+  lib.rs              # Crate root, prelude
+  graph/              # StateGraph, CompiledGraph
+  pregel/             # Execution engine, Branch, BranchResult
+  state.rs            # State, Message, MessagesState
+  nodes.rs            # Node trait
+  checkpoint/         # Checkpoint types & saver trait
+  checkpoint_backends/
+  llm/                # ChatModel, Ollama / OpenAI / OpenRouter / Anthropic (feature-gated)
+  prebuilt/           # ReAct agent, tools (feature-gated)
+examples/             # Runnable examples (see table below)
+tests/                # Integration tests (e.g. Ollama, --ignored)
+```
 
-1. **Channels** hold graph state with merge semantics
-2. **Nodes** are triggered when their input channels are written
-3. **Execution Loop** (Pregel):
-   - Find triggered nodes
-   - Execute nodes in parallel
-   - Apply writes to channels
-   - Save checkpoint
-   - Repeat until no more triggers
+**Full API details:** run `cargo doc --open` or visit [docs.rs/rust-langgraph](https://docs.rs/rust-langgraph).
 
-This design enables:
-- Automatic parallelization
-- Deterministic execution
-- Seamless checkpoint/resume
-- Flexible state management
+---
 
 ## Examples
 
-Check the `examples/` directory for more examples:
-
-- [`01_simple_graph.rs`](examples/01_simple_graph.rs) - Basic nodes and edges
-- [`02_conditional_edges.rs`](examples/02_conditional_edges.rs) - Branching logic
-- [`03_checkpointing.rs`](examples/03_checkpointing.rs) - Save and resume
-- [`04_streaming.rs`](examples/04_streaming.rs) - Stream events in real-time
-- [`05_ollama_chat.rs`](examples/05_ollama_chat.rs) - Simple Ollama chat integration
-- [`06_react_agent_ollama.rs`](examples/06_react_agent_ollama.rs) - ReAct agent with tools and Ollama
-- [`08_custom_state.rs`](examples/08_custom_state.rs) - Custom state types
-
-Run an example:
+| Example | Command | Features |
+|---------|---------|----------|
+| Minimal graph | `cargo run --example simple_graph` | default |
+| Branching | `cargo run --example conditional_edges` | default |
+| Checkpoints | `cargo run --example checkpointing` | default |
+| Streaming | `cargo run --example streaming` | default |
+| Ollama chat | `cargo run --example ollama_chat` | `ollama` |
+| ReAct + Ollama | `cargo run --example react_agent_ollama` | `ollama`, `prebuilt` |
+| OpenRouter chat | `cargo run --example openrouter_chat` | `openrouter` |
+| Custom state | `cargo run --example custom_state` | default |
 
 ```bash
-# Basic examples
+cd rust-langgraph
 cargo run --example simple_graph
-
-# LLM examples (requires Ollama running locally)
 cargo run --example ollama_chat --features ollama
 cargo run --example react_agent_ollama --features ollama,prebuilt
+set OPENROUTER_API_KEY=sk-or-v1-...
+cargo run --example openrouter_chat --features openrouter
 ```
+
+---
+
+## Documentation
+
+- **Human readers:** this README + **[`AGENTS.md`](AGENTS.md)** (also useful for contributors) + **rustdoc** (`cargo doc --no-deps --open`).
+- **AI coding agents:** read **`AGENTS.md`** first — it lists crate name, features, patterns, and pitfalls so assistants generate correct `rust-langgraph` code.
+
+---
 
 ## Comparison with Python LangGraph
 
-This Rust crate aims for API and behavior alignment where practical with Python LangGraph:
+This crate targets **similar ideas** (state graph, checkpoints, agents) but is a **separate implementation**. APIs and wire formats are aligned where practical; behavior may differ in edge cases. For the official Python stack, use LangChain’s LangGraph.
 
-| Feature | Rust LangGraph | Python LangGraph |
-|---------|----------------|------------------|
-| StateGraph API | ✅ | ✅ |
-| Checkpointing | ✅ | ✅ |
-| Streaming | ✅ | ✅ |
-| Conditional edges | ✅ | ✅ |
-| Parallel execution | ✅ | ✅ |
-| Human-in-the-loop | ✅ | ✅ |
-| Checkpoint format | Compatible | Compatible |
-| Performance | Faster | Slower |
+| Area | Rust LangGraph | Python LangGraph |
+|------|----------------|------------------|
+| Language | Rust | Python |
+| Package | `rust-langgraph` / `rust_langgraph` | `langgraph` |
+| Official? | Community | LangChain |
+
+---
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Issues and PRs are welcome. Please keep changes focused and match existing style.
+
+---
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-- Inspired by [LangGraph](https://github.com/langchain-ai/langgraph) from LangChain
-- Built on the Pregel execution model from Google
+- Inspired by [LangGraph](https://github.com/langchain-ai/langgraph) (LangChain).
+- Execution model influenced by Google’s Pregel.
 
-## Support
+## Links
 
-- [Documentation](https://docs.rs/rust-langgraph)
+- [docs.rs/rust-langgraph](https://docs.rs/rust-langgraph)
 - [Examples](examples/)
-- [Issue Tracker](https://github.com/yourusername/rust-langgraph/issues)

@@ -48,7 +48,12 @@
 //! - **Conditional Logic**: Dynamic routing based on state
 //! - **Parallel Execution**: Execute independent nodes concurrently
 //! - **Human-in-the-Loop**: Interrupt and resume with human input
-//! - **LLM Integration**: Built-in support for OpenAI, Anthropic, and Ollama
+//! - **LLM Integration**: OpenAI, OpenRouter, Anthropic, and Ollama adapters (feature-gated)
+//!
+//! ## More documentation
+//!
+//! - **README.md** — full user guide (install, tutorial, API table, examples)
+//! - **AGENTS.md** — cheat sheet for AI coding agents and contributors (correct crate name, features, patterns, pitfalls)
 
 pub mod config;
 pub mod errors;
@@ -64,7 +69,12 @@ pub mod checkpoint;
 #[cfg(feature = "memory-checkpoint")]
 pub mod checkpoint_backends;
 
-#[cfg(any(feature = "openai", feature = "anthropic", feature = "ollama"))]
+#[cfg(any(
+    feature = "openai",
+    feature = "openrouter",
+    feature = "anthropic",
+    feature = "ollama"
+))]
 pub mod llm;
 
 #[cfg(feature = "prebuilt")]
@@ -88,7 +98,12 @@ pub mod prelude {
     #[cfg(feature = "prebuilt")]
     pub use crate::prebuilt::{create_react_agent, Tool, ToolNode};
     
-    #[cfg(any(feature = "openai", feature = "anthropic", feature = "ollama"))]
+    #[cfg(any(
+        feature = "openai",
+        feature = "openrouter",
+        feature = "anthropic",
+        feature = "ollama"
+    ))]
     pub use crate::llm::ChatModel;
 }
 

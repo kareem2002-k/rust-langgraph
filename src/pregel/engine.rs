@@ -1,18 +1,16 @@
 //! Core Pregel execution engine.
 //!
-//! This is the heart of LangGraph - a channel-centric superstep execution engine
-//! inspired by Google's Pregel. Unlike the rust-try-1 implementation which ignores
-//! channels and checkpointers, this implementation ACTUALLY USES THEM.
+//! Channel-centric superstep execution inspired by Google’s Pregel: nodes run when
+//! triggered, writes flow through channels with merge semantics, and checkpoints
+//! persist progress between steps.
 
 use crate::channels::BaseChannel;
 use crate::checkpoint::{BaseCheckpointSaver, Checkpoint, CheckpointMetadata, StateSnapshot};
 use crate::config::Config;
 use crate::errors::{Error, Result};
 use crate::nodes::PregelNode;
-use crate::pregel::branch::BranchResult;
 use crate::state::State;
-use crate::types::{Send as SendType, StreamEvent, StreamMode};
-use crate::runtime::Runtime;
+use crate::types::{StreamEvent, StreamMode};
 use futures::stream::{Stream, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -35,10 +33,10 @@ pub struct Pregel<S: State> {
     /// The nodes in the graph
     nodes: HashMap<String, PregelNode<S>>,
 
-    /// The channels (THIS IS ACTUALLY USED, unlike rust-try-1!)
+    /// Channels holding graph state between supersteps
     channels: HashMap<String, Box<dyn BaseChannel>>,
 
-    /// Optional checkpoint saver (THIS IS ACTUALLY USED!)
+    /// Optional checkpoint saver for persistence
     checkpointer: Option<Arc<dyn BaseCheckpointSaver>>,
 
     /// Entry point node name
@@ -204,14 +202,14 @@ impl<S: State> Pregel<S> {
         self.write_input_to_channels(&input)?;
 
         // Clone necessary data for the async task
-        let nodes = self.nodes.clone();
-        let mut channels: HashMap<String, Box<dyn BaseChannel>> = HashMap::new();
+        let _nodes = self.nodes.clone();
+        let _channels: HashMap<String, Box<dyn BaseChannel>> = HashMap::new();
         // Note: We can't clone channels easily due to trait object limitations
         // For now, we'll implement a simpler version
 
         // Execute and stream
-        let checkpointer = self.checkpointer.clone();
-        let entry_point = self.entry_point.clone();
+        let _checkpointer = self.checkpointer.clone();
+        let _entry_point = self.entry_point.clone();
         let recursion_limit = self.recursion_limit;
 
         tokio::spawn(async move {
@@ -321,7 +319,7 @@ impl<S: State> Pregel<S> {
     }
 
     /// Read state for a specific node from its input channels
-    fn read_state_for_node(&self, node: &PregelNode<S>) -> Result<S> {
+    fn read_state_for_node(&self, _node: &PregelNode<S>) -> Result<S> {
         // For now, simple implementation: read from __start__ or construct empty state
         // Full implementation would read from node's specific channels and construct state
 

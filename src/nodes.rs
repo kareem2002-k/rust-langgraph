@@ -4,12 +4,11 @@
 //! as input and produces updated state as output.
 
 use crate::config::Config;
-use crate::errors::{Error, Result};
+use crate::errors::Result;
 use crate::state::State;
 use async_trait::async_trait;
 use std::fmt::Debug;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 /// The core trait for graph nodes.
