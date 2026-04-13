@@ -8,6 +8,7 @@ use crate::channels::BaseChannel;
 use crate::checkpoint::{BaseCheckpointSaver, Checkpoint, CheckpointMetadata, StateSnapshot};
 use crate::config::Config;
 use crate::errors::{Error, Result};
+use crate::graph::START;
 use crate::nodes::PregelNode;
 use crate::state::State;
 use crate::types::{StreamEvent, StreamMode};
@@ -149,8 +150,9 @@ impl<S: State> Pregel<S> {
                 }
             }
 
-            // Apply writes to channels
-            self.apply_updates(updates)?;
+            // Apply writes to channels and collect which channels were written this superstep.
+            // Those channels trigger the next wave of nodes (do not clear — replace).
+            self.written_channels = self.apply_updates(updates)?;
 
             // Check for interrupts/commands
             // (For now, we'll implement basic interrupt support later)
@@ -168,7 +170,6 @@ impl<S: State> Pregel<S> {
             }
 
             self.current_step += 1;
-            self.written_channels.clear(); // Clear for next superstep
         }
 
         // 4. Return final state
@@ -318,47 +319,70 @@ impl<S: State> Pregel<S> {
         triggered
     }
 
-    /// Read state for a specific node from its input channels
-    fn read_state_for_node(&self, _node: &PregelNode<S>) -> Result<S> {
-        // For now, simple implementation: read from __start__ or construct empty state
-        // Full implementation would read from node's specific channels and construct state
+    /// Read state for a specific node from its input channels (`{name}_input`), merged in order.
+    /// If those channels are empty but this node is triggered by `__start__`, read the graph input from `__start__`.
+    fn read_state_for_node(&self, node: &PregelNode<S>) -> Result<S> {
+        let mut merged: Option<S> = None;
 
-        if let Some(channel) = self.channels.get("__start__") {
-            if let Some(value) = channel.get()? {
-                return S::from_value(value);
+        for ch_name in &node.channels {
+            if let Some(channel) = self.channels.get(ch_name) {
+                if let Some(value) = channel.get()? {
+                    let piece = S::from_value(value)?;
+                    merged = match merged {
+                        None => Some(piece),
+                        Some(mut m) => {
+                            m.merge(piece)?;
+                            Some(m)
+                        }
+                    };
+                }
             }
         }
 
-        // If no input, create from channels that node reads
-        // For MVP, this is simplified
-        Err(Error::state("Cannot construct state from channels"))
+        if merged.is_none() && node.triggers.iter().any(|t| t == START) {
+            if let Some(channel) = self.channels.get(START) {
+                if let Some(value) = channel.get()? {
+                    merged = Some(S::from_value(value)?);
+                }
+            }
+        }
+
+        merged.ok_or_else(|| {
+            Error::state(format!(
+                "Cannot construct state for node '{}' (input channels {:?})",
+                node.name, node.channels
+            ))
+        })
     }
 
-    /// Apply node updates to channels
-    fn apply_updates(&mut self, updates: HashMap<String, S>) -> Result<()> {
+    /// Apply node outputs to `{node}_output` and fan out the same state to each edge target's `{target}_input`.
+    /// Returns the set of channel names written this superstep — these trigger the next superstep (replacing the previous set).
+    fn apply_updates(&mut self, updates: HashMap<String, S>) -> Result<HashSet<String>> {
+        let mut next_triggers = HashSet::new();
+
         for (node_name, state) in updates {
-            // Get the node's writer specifications
+            let value = state.to_value()?;
+
             if let Some(node) = self.nodes.get(&node_name) {
-                // For each writer, write the state to the channel
                 for writer in &node.writers {
-                    let value = state.to_value()?;
                     if let Some(channel) = self.channels.get_mut(&writer.channel) {
                         channel.update(vec![value.clone()])?;
-                        self.written_channels.insert(writer.channel.clone());
+                        next_triggers.insert(writer.channel.clone());
                     }
                 }
             }
 
-            // Also follow static edges
             if let Some(targets) = self.edges.get(&node_name) {
                 for target in targets {
-                    // Mark target's input channel as written
-                    self.written_channels.insert(format!("{}_input", target));
+                    let input_ch = format!("{}_input", target);
+                    if let Some(ch) = self.channels.get_mut(&input_ch) {
+                        ch.update(vec![value.clone()])?;
+                    }
                 }
             }
         }
 
-        Ok(())
+        Ok(next_triggers)
     }
 
     /// Create a checkpoint from current channel states
@@ -405,17 +429,27 @@ impl<S: State> Pregel<S> {
         Err(Error::checkpoint("Cannot construct state from checkpoint"))
     }
 
-    /// Get the final state after execution
+    /// Get the final state after execution.
+    ///
+    /// Prefer `__end__`, then each finish node's `{name}_output` (where compiled graphs write),
+    /// then `__start__` as last resort.
     fn get_final_state(&self) -> Result<S> {
-        // Read from output channels
-        if let Some(channel) = self.channels.get("__end__") {
+        if let Some(channel) = self.channels.get(crate::graph::END) {
             if let Some(value) = channel.get()? {
                 return S::from_value(value);
             }
         }
 
-        // Fallback: read from __start__ channel
-        if let Some(channel) = self.channels.get("__start__") {
+        for fp in &self.finish_points {
+            let ch_name = format!("{}_output", fp);
+            if let Some(channel) = self.channels.get(&ch_name) {
+                if let Some(value) = channel.get()? {
+                    return S::from_value(value);
+                }
+            }
+        }
+
+        if let Some(channel) = self.channels.get(START) {
             if let Some(value) = channel.get()? {
                 return S::from_value(value);
             }
@@ -429,7 +463,7 @@ impl<S: State> Pregel<S> {
 mod tests {
     use super::*;
     use crate::channels::{LastValue};
-    use crate::nodes::{Node, PregelNode, ChannelWrite};
+    use crate::nodes::{PregelNode, ChannelWrite};
     use crate::state::State as StateTrait;
     use serde::{Deserialize, Serialize};
 
@@ -478,5 +512,61 @@ mod tests {
         let result = pregel.invoke(input, Config::default()).await.unwrap();
 
         assert_eq!(result.count, 1);
+    }
+
+    /// Two-node chain: second superstep must run (triggers from previous `{src}_output`), and
+    /// downstream reads merged state from `{dst}_input` (not only `__start__`).
+    #[tokio::test]
+    async fn test_pregel_two_node_chain() {
+        let a = PregelNode::from_node(
+            "a",
+            vec!["a_input".to_string()],
+            vec![START.to_string()],
+            |mut state: TestState, _config: &Config| async move {
+                state.count += 1;
+                Ok(state)
+            },
+            vec![ChannelWrite::new("a_output")],
+        );
+        let b = PregelNode::from_node(
+            "b",
+            vec!["b_input".to_string()],
+            vec!["a_output".to_string()],
+            |mut state: TestState, _config: &Config| async move {
+                state.count *= 10;
+                Ok(state)
+            },
+            vec![ChannelWrite::new("b_output")],
+        );
+
+        let mut nodes = HashMap::new();
+        nodes.insert("a".to_string(), a);
+        nodes.insert("b".to_string(), b);
+
+        let mut channels: HashMap<String, Box<dyn BaseChannel>> = HashMap::new();
+        channels.insert(START.to_string(), Box::new(LastValue::<TestState>::new()));
+        channels.insert("a_input".to_string(), Box::new(LastValue::<TestState>::new()));
+        channels.insert("a_output".to_string(), Box::new(LastValue::<TestState>::new()));
+        channels.insert("b_input".to_string(), Box::new(LastValue::<TestState>::new()));
+        channels.insert("b_output".to_string(), Box::new(LastValue::<TestState>::new()));
+        channels.insert("__end__".to_string(), Box::new(LastValue::<TestState>::new()));
+
+        let mut edges = HashMap::new();
+        edges.insert("a".to_string(), vec!["b".to_string()]);
+
+        let mut pregel = Pregel::new(
+            nodes,
+            channels,
+            None,
+            "a".to_string(),
+            HashSet::from(["b".to_string()]),
+            edges,
+        );
+
+        let result = pregel
+            .invoke(TestState { count: 5 }, Config::default())
+            .await
+            .unwrap();
+        assert_eq!(result.count, 60); // (5 + 1) * 10
     }
 }

@@ -15,7 +15,7 @@
 
 1. **StateGraph** — `add_node`, `add_edge`, `add_conditional_edges`, `compile`
 2. **Channels** — `LastValue`, `Topic`, `BinaryOperatorAggregate`, `EphemeralValue`
-3. **Pregel engine** — superstep loop, parallel node execution, channel read/write
+3. **Pregel engine** — superstep loop, parallel node execution, channel read/write (v0.1.1+: next superstep triggers from this step’s writes; edge fan-out copies state to `{target}_input`; `read_state_for_node` merges inputs / `__start__` for entry; `get_final_state` prefers finish `{node}_output`)
 4. **Checkpointing** — `Checkpoint`, `BaseCheckpointSaver`, `MemorySaver`; DB backends are feature-gated / in progress
 5. **Branching** — `Branch`, `BranchResult` (including `Send` for dynamic routing)
 6. **LLM** — `ChatModel`, `ToolInfo`; `OllamaAdapter`, `OpenAIAdapter`, `OpenRouterAdapter`, `AnthropicAdapter` (feature-gated)
